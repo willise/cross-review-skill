@@ -257,11 +257,26 @@ BEHAVIOR
 # Reviewer invocation
 # ============================================================
 
+# Codex CLI changed shape over time: builds with the global `--full-auto` flag
+# accept it before the subcommand, newer builds only accept `codex exec` with an
+# explicit sandbox policy and reject `--full-auto`. Probe once and use whichever
+# form the installed CLI understands.
+codex_supports_full_auto() {
+  codex --help 2>/dev/null | grep -q -- '--full-auto'
+}
+
 invoke_codex() {
-  local prompt_text
-  prompt_text="$(/bin/cat "$prompt_file")"
-  run_with_timeout "$timeout_seconds" "$repo_abs" "" "$assessment_log" "$assessment_log" "1" \
-    codex --full-auto exec --skip-git-repo-check -o "$assessment_file" "$prompt_text"
+  if codex_supports_full_auto; then
+    local prompt_text
+    prompt_text="$(/bin/cat "$prompt_file")"
+    run_with_timeout "$timeout_seconds" "$repo_abs" "" "$assessment_log" "$assessment_log" "1" \
+      codex --full-auto exec --skip-git-repo-check -o "$assessment_file" "$prompt_text"
+    return
+  fi
+  # Newer builds: read-only sandbox is enough for a review, and the prompt goes
+  # in over stdin so large diffs never hit the argument length limit.
+  run_with_timeout "$timeout_seconds" "$repo_abs" "$prompt_file" "$assessment_log" "$assessment_log" "1" \
+    codex exec --skip-git-repo-check -s read-only -C "$repo_abs" -o "$assessment_file" -
 }
 
 invoke_claude() {
@@ -328,7 +343,7 @@ write_summary() {
 # ============================================================
 
 repo="" output_dir="" mode="" range_spec="" reviewer="auto"
-context_file="" context_stdin=0 question="" timeout_seconds=90
+context_file="" context_stdin=0 question="" timeout_seconds=300
 dry_run=0 inline_diff_max_bytes=20000 inline_path_max_bytes=40000
 declare -a review_paths=()
 

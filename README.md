@@ -49,6 +49,10 @@ At least one external reviewer CLI must be installed and authenticated:
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`)
 - [Codex](https://github.com/openai/codex) (`codex`)
 
+The helper probes the installed Codex CLI and uses whichever invocation form it supports:
+`codex exec --skip-git-repo-check -s read-only ...` on builds that dropped the global
+`--full-auto` flag, and `codex --full-auto exec ...` on older ones.
+
 ## License
 
 MIT

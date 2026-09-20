@@ -87,4 +87,6 @@ At least one external reviewer CLI must be installed and authenticated:
 - `codex`
 - `claude`
 
-Which one is required depends on the selected reviewer target.
+Which one is required depends on the selected reviewer target. The helper probes the installed
+Codex CLI and uses whichever invocation form it supports (`codex exec -s read-only ...` on newer
+builds, `codex --full-auto exec ...` on older ones).

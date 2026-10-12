@@ -84,9 +84,10 @@ These files are intentionally compact. They are guardrails, not the main payload
 
 At least one external reviewer CLI must be installed and authenticated:
 
-- `codex`
+- `codex` (the helper sets `CODEX_HOME=~/.codex-trae`, matching the interactive `codext` alias)
 - `claude`
 
-Which one is required depends on the selected reviewer target. The helper probes the installed
-Codex CLI and uses whichever invocation form it supports (`codex exec -s read-only ...` on newer
-builds, `codex --full-auto exec ...` on older ones).
+Which one is required depends on the selected reviewer target. For a Codex reviewer, the helper
+uses `env CODEX_HOME="$HOME/.codex-trae" codex` explicitly because non-interactive Bash does not
+expand the `codext` alias. It then selects the supported invocation form (`exec -s read-only ...` on newer builds or
+`--full-auto exec ...` on older ones).

@@ -78,7 +78,7 @@ resolve_target_reviewer() {
 resolve_output_root() {
   case "$1" in
     claude) printf '%s' "$HOME/.claude/file-history/cross-code-review" ;;
-    codex)  printf '%s' "${CODEX_HOME:-$HOME/.codex}/tmp/cross-code-review" ;;
+    codex)  printf '%s' "$HOME/.codex-trae/tmp/cross-code-review" ;;
     *)      printf '%s' "${XDG_STATE_HOME:-$HOME/.local/state}/cross-code-review" ;;
   esac
 }
@@ -257,12 +257,15 @@ BEHAVIOR
 # Reviewer invocation
 # ============================================================
 
+# `codext` is an interactive-shell alias for `CODEX_HOME=$HOME/.codex-trae codex`.
+# Bash scripts do not expand aliases, so invoke the expanded command explicitly.
+
 # Codex CLI changed shape over time: builds with the global `--full-auto` flag
 # accept it before the subcommand, newer builds only accept `codex exec` with an
 # explicit sandbox policy and reject `--full-auto`. Probe once and use whichever
 # form the installed CLI understands.
 codex_supports_full_auto() {
-  codex --help 2>/dev/null | grep -q -- '--full-auto'
+  env CODEX_HOME="$HOME/.codex-trae" codex --help 2>/dev/null | grep -q -- '--full-auto'
 }
 
 invoke_codex() {
@@ -270,13 +273,13 @@ invoke_codex() {
     local prompt_text
     prompt_text="$(/bin/cat "$prompt_file")"
     run_with_timeout "$timeout_seconds" "$repo_abs" "" "$assessment_log" "$assessment_log" "1" \
-      codex --full-auto exec --skip-git-repo-check -o "$assessment_file" "$prompt_text"
+      env CODEX_HOME="$HOME/.codex-trae" codex --full-auto exec --skip-git-repo-check -o "$assessment_file" "$prompt_text"
     return
   fi
   # Newer builds: read-only sandbox is enough for a review, and the prompt goes
   # in over stdin so large diffs never hit the argument length limit.
   run_with_timeout "$timeout_seconds" "$repo_abs" "$prompt_file" "$assessment_log" "$assessment_log" "1" \
-    codex exec --skip-git-repo-check -s read-only -C "$repo_abs" -o "$assessment_file" -
+    env CODEX_HOME="$HOME/.codex-trae" codex exec --skip-git-repo-check -s read-only -C "$repo_abs" -o "$assessment_file" -
 }
 
 invoke_claude() {
@@ -497,4 +500,7 @@ printf 'assessment_exit=%s\nassessment_status=%s\nassessment_reason=%s\n' \
 printf 'target_reviewer=%s\nprompt_file=%s\nsummary_file=%s\nassessment_file=%s\nreviewer_file=%s\nassessment_log=%s\n' \
   "$target_reviewer" "$prompt_file" "$summary_file" "$assessment_file" "$reviewer_file" "$assessment_log"
 
-[[ "$assessment_exit" -ne 0 ]] && exit 1
+if [[ "$assessment_exit" -ne 0 ]]; then
+  exit 1
+fi
+exit 0

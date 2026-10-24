@@ -8,13 +8,20 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  run-cross-review.sh --repo <path> [--output-dir <path>] [--reviewer auto|codex|claude] [--context-file <path> | --context-stdin] [--question <text>] [--timeout-seconds <n>] (--staged | --working | --range <revset> | --path <path> [--path <path> ...]) [--dry-run]
+  run-cross-review.sh --repo <path> [--output-dir <path>] [--reviewer auto|codex|claude] [--context-file <path> | --context-stdin] [--question <text>] [--timeout-seconds <n>] [--resume-timeout-seconds <n>] [--diff-context <n>] [--include-generated] (--staged | --working | --range <revset> | --base <ref> | --pr <number> | --path <path> [--path <path> ...]) [--dry-run]
+
+Defaults: 900 seconds for review; Claude gets one same-session, tools-disabled
+wrap-up after timeout, with a separate 300-second limit. Diffs carry 10 lines of
+context and skip lockfiles/generated files unless --include-generated is given.
+An empty diff exits with status 3 without calling a reviewer.
 
 Examples:
   run-cross-review.sh --repo /path/to/repo --staged
   cat context.md | run-cross-review.sh --repo /path/to/repo --working --reviewer claude --context-stdin
   run-cross-review.sh --repo /path/to/repo --working --timeout-seconds 120
   run-cross-review.sh --repo /path/to/repo --range 'main...HEAD' --reviewer codex --question 'Is there a safer alternative?'
+  run-cross-review.sh --repo /path/to/repo --base main
+  run-cross-review.sh --repo /path/to/repo --pr 123
   run-cross-review.sh --repo /path/to/repo --path src/foo.ts --path src/bar.ts
 EOF
 }
@@ -40,12 +47,19 @@ run_with_timeout() {
     cd "$workdir"
     [[ -n "$stdin_file" ]] && exec 0<"$stdin_file" || exec 0</dev/null
     [[ "$merge_stderr" == "1" ]] \
-      && exec "$@" >"$stdout_file" 2>&1 \
-      || exec "$@" >"$stdout_file" 2>"$stderr_file"
+      && exec "$@" >>"$stdout_file" 2>&1 \
+      || exec "$@" >>"$stdout_file" 2>>"$stderr_file"
   ) &
   local pid=$!
 
-  ( sleep "$secs" && kill -TERM "$pid" 2>/dev/null && sleep 2 && kill -KILL "$pid" 2>/dev/null ) &
+  # The watchdog must not hold our stdout open, and must take its `sleep` down
+  # with it; an orphaned sleep would block any caller reading our output.
+  (
+    trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
+    sleep "$secs" & sleeper=$!
+    wait "$sleeper"
+    kill -TERM "$pid" 2>/dev/null && sleep 2 && kill -KILL "$pid" 2>/dev/null
+  ) </dev/null >/dev/null 2>&1 &
   local timer=$!
 
   local rc=0; wait "$pid" || rc=$?
@@ -78,7 +92,7 @@ resolve_target_reviewer() {
 resolve_output_root() {
   case "$1" in
     claude) printf '%s' "$HOME/.claude/file-history/cross-code-review" ;;
-    codex)  printf '%s' "${CODEX_HOME:-$HOME/.codex}/tmp/cross-code-review" ;;
+    codex)  printf '%s' "$HOME/.codex-trae/tmp/cross-code-review" ;;
     *)      printf '%s' "${XDG_STATE_HOME:-$HOME/.local/state}/cross-code-review" ;;
   esac
 }
@@ -87,33 +101,67 @@ resolve_output_root() {
 # Diff generation (one function per mode)
 # ============================================================
 
+# Lockfiles, vendored and generated files add noise without review value.
+build_pathspec() {
+  pathspec=(.)
+  [[ "$include_generated" -eq 1 ]] && return
+  local pattern
+  for pattern in '*.lock' package-lock.json pnpm-lock.yaml go.sum '*.min.js' '*.min.css' \
+                 '*.map' '*.pb.go' '*_pb2.py' '*_pb2_grpc.py' 'vendor/**' 'node_modules/**'; do
+    pathspec+=(":(glob,exclude)**/$pattern")
+  done
+}
+
+git_diff() {
+  git -C "$repo_abs" diff --no-ext-diff -U"$diff_context" "$@"
+}
+
 generate_diff_staged() {
   diff_file="$output_dir/staged.diff"
-  ( cd "$repo_abs" && git diff --cached >"$diff_file" )
+  git_diff --cached -- "${pathspec[@]}" >"$diff_file"
   scope_note="Assess the staged git diff snapshot at: $diff_file"
 }
 
 generate_diff_working() {
   diff_file="$output_dir/working.diff"
-  (
-    cd "$repo_abs"
-    git diff HEAD --no-ext-diff >"$diff_file"
-    local untracked
-    untracked="$(git ls-files --others --exclude-standard)"
-    if [[ -n "$untracked" ]]; then
-      while IFS= read -r relpath; do
-        [[ -n "$relpath" ]] || continue
-        git diff --no-index -- /dev/null "$repo_abs/$relpath" >>"$diff_file" || true
-      done <<<"$untracked"
+  git_diff HEAD -- "${pathspec[@]}" >"$diff_file"
+  local relpath sz
+  while IFS= read -r relpath; do
+    [[ -n "$relpath" ]] || continue
+    sz="$(wc -c <"$repo_abs/$relpath" | tr -d '[:space:]')"
+    if [[ "$sz" -gt "$untracked_max_bytes" ]]; then
+      printf '%s (untracked, %s bytes)\n' "$relpath" "$sz" >>"$skipped_file"
+      continue
     fi
-  )
+    # Relative path from the repo root keeps diff headers as a/<path> b/<path>.
+    ( cd "$repo_abs" && git diff --no-index --no-ext-diff -- /dev/null "$relpath" ) >>"$diff_file" || true
+  done < <(git -C "$repo_abs" ls-files --others --exclude-standard -- "${pathspec[@]}")
   scope_note="Assess the working-tree diff snapshot at: $diff_file"
 }
 
 generate_diff_range() {
   diff_file="$output_dir/range.diff"
-  ( cd "$repo_abs" && git diff "$range_spec" >"$diff_file" )
+  git_diff "$range_spec" -- "${pathspec[@]}" >"$diff_file"
   scope_note="Assess the git diff snapshot for range '$range_spec' at: $diff_file"
+}
+
+# Prefer a local diff (context lines + generated-file filter); fall back to
+# `gh pr diff` when the PR head or base is not available locally.
+generate_diff_pr() {
+  command -v gh >/dev/null 2>&1 || { echo "--pr requires the gh CLI." >&2; exit 1; }
+  diff_file="$output_dir/pr.diff"
+  local meta base head
+  meta="$(cd "$repo_abs" && gh pr view "$pr_number" --json baseRefName,headRefOid --jq '.baseRefName + " " + .headRefOid')"
+  base="${meta%% *}" head="${meta##* }"
+  if git -C "$repo_abs" rev-parse -q --verify "origin/$base^{commit}" >/dev/null \
+     && git -C "$repo_abs" cat-file -e "$head^{commit}" 2>/dev/null; then
+    range_spec="origin/$base...$head"
+    git_diff "$range_spec" -- "${pathspec[@]}" >"$diff_file"
+    scope_note="Assess pull request #$pr_number (range '$range_spec') diff snapshot at: $diff_file"
+  else
+    ( cd "$repo_abs" && gh pr diff "$pr_number" ) >"$diff_file"
+    scope_note="Assess pull request #$pr_number diff snapshot (from gh, default context, unfiltered) at: $diff_file"
+  fi
 }
 
 generate_diff_paths() {
@@ -121,8 +169,9 @@ generate_diff_paths() {
   local total_bytes=0 can_inline=1
   for p in "${review_paths[@]}"; do
     printf '%s\n' "$p" >>"$path_list_file"
+    local abs="$repo_abs/$p"
+    [[ -e "$abs" ]] || { echo "Requested path does not exist: $p" >&2; exit 1; }
     if [[ "$can_inline" -eq 1 ]]; then
-      local abs="$repo_abs/$p"
       if [[ ! -f "$abs" ]]; then
         can_inline=0
       else
@@ -142,6 +191,62 @@ generate_diff_paths() {
     path_contents_inline=1
   fi
   scope_note="Assess only the paths listed in: $path_list_file"
+}
+
+# ============================================================
+# Review context: changed files, project rules, recent history
+# ============================================================
+
+collect_changed_files() {
+  if [[ -n "$diff_file" ]]; then
+    sed -n 's|^diff --git a/.* b/||p' "$diff_file" | sort -u >"$changed_files_file"
+  else
+    printf '%s\n' "${review_paths[@]}" >"$changed_files_file"
+  fi
+}
+
+# CLAUDE.md / AGENTS.md at the repo root and in every directory above a changed
+# file. Inlined because a self-contained reviewer has no tools to find them.
+collect_project_rules() {
+  : >"$rules_file"
+  local seen="" total=0 f dir name cand sz
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if [[ -d "$repo_abs/$f" ]]; then dir="${f%/}"; else dir="$(dirname "$f")"; fi
+    while :; do
+      for name in CLAUDE.md AGENTS.md; do
+        [[ "$dir" == "." ]] && cand="$name" || cand="$dir/$name"
+        [[ -f "$repo_abs/$cand" ]] || continue
+        grep -Fxq -- "$cand" <<<"$seen" && continue
+        seen+="$cand"$'\n'
+        sz="$(wc -c <"$repo_abs/$cand" | tr -d '[:space:]')"
+        if [[ $((total + sz)) -gt "$rules_max_bytes" ]]; then
+          printf '### %s\n\n(omitted: rules size budget exceeded)\n\n' "$cand" >>"$rules_file"
+          continue
+        fi
+        total=$((total + sz))
+        { printf '### %s\n\n' "$cand"; /bin/cat "$repo_abs/$cand"; printf '\n\n'; } >>"$rules_file"
+      done
+      [[ "$dir" == "." || "$dir" == "/" ]] && break
+      dir="$(dirname "$dir")"
+    done
+  done < <(printf '.root\n'; /bin/cat "$changed_files_file")
+}
+
+collect_history() {
+  : >"$history_file"
+  git -C "$repo_abs" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  local n=0 f log
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if [[ "$n" -ge "$history_max_files" ]]; then
+      printf '(history for remaining files omitted)\n' >>"$history_file"; break
+    fi
+    log="$(git -C "$repo_abs" log -n 5 --no-merges --date=short --format='%h %ad %s' -- "$f" 2>/dev/null || true)"
+    [[ -n "$log" ]] || continue
+    printf '### %s\n\n%s\n\n' "$f" "$log" >>"$history_file"
+    n=$((n + 1))
+  done <"$changed_files_file"
 }
 
 # ============================================================
@@ -216,6 +321,25 @@ STRATEGY
       printf '\n\n'
     fi
 
+    if [[ -s "$rules_file" ]]; then
+      printf '## Project Rules\n\n'
+      printf 'These files guide authors working in this repository. Flag a violation only when a rule explicitly covers it, and quote the rule.\n\n'
+      /bin/cat "$rules_file"
+    fi
+
+    if [[ -s "$history_file" ]]; then
+      printf '## Recent History Of Changed Files\n\n'
+      printf 'Use this to judge whether a behavior change looks intentional or reverts an earlier fix.\n\n'
+      /bin/cat "$history_file"
+    fi
+
+    if [[ "$include_generated" -eq 0 || -s "$skipped_file" ]]; then
+      printf '## Excluded From The Snapshot\n\n'
+      [[ "$include_generated" -eq 0 ]] && printf -- '- Lockfiles, vendored and generated files (e.g. *.lock, go.sum, *.min.js, *.pb.go) are filtered out.\n'
+      [[ -s "$skipped_file" ]] && sed 's/^/- /' "$skipped_file"
+      printf '\n'
+    fi
+
     # Questions
     if [[ -n "$question" ]]; then
       printf '## Specific Question\n\n%s\n\n' "$question"
@@ -244,7 +368,8 @@ QUESTIONS
 - Avoid broad repository discovery work unless it is necessary to resolve a material ambiguity.
 - Avoid generic code-style commentary unless it materially affects the proposal.
 - Ground claims in the code, diff, or provided context.
-- Follow the change-evaluation guide below as a guardrail.
+- Only report problems introduced or exposed by this change, not pre-existing ones on untouched lines.
+- Follow the change-evaluation guide below, including its false-positive list, confidence rubric, and exact output format.
 
 BEHAVIOR
 
@@ -257,43 +382,48 @@ BEHAVIOR
 # Reviewer invocation
 # ============================================================
 
-# Codex CLI changed shape over time: builds with the global `--full-auto` flag
-# accept it before the subcommand, newer builds only accept `codex exec` with an
-# explicit sandbox policy and reject `--full-auto`. Probe once and use whichever
-# form the installed CLI understands.
-codex_supports_full_auto() {
-  codex --help 2>/dev/null | grep -q -- '--full-auto'
+# `codext` is an interactive-shell alias for `CODEX_HOME=$HOME/.codex-trae codex`.
+# Bash scripts do not expand aliases, so invoke the expanded command explicitly.
+
+CODEX_REVIEW_MODEL="trae/gpt-6.1-sol-max"
+CODEX_REVIEW_EFFORT="high"
+codex_cmd=(env CODEX_HOME="$HOME/.codex-trae" codex)
+
+# Codex CLI changed shape over time: older builds carry the global
+# `--full-auto` flag and take the prompt as an argument; newer builds reject
+# it and read the prompt from stdin. Either way the review runs in a read-only
+# sandbox (`--full-auto` would grant workspace-write, so it is never passed).
+codex_is_legacy() {
+  "${codex_cmd[@]}" --help 2>/dev/null | grep -q -- '--full-auto'
 }
 
 invoke_codex() {
-  if codex_supports_full_auto; then
-    local prompt_text
-    prompt_text="$(/bin/cat "$prompt_file")"
-    run_with_timeout "$timeout_seconds" "$repo_abs" "" "$assessment_log" "$assessment_log" "1" \
-      codex --full-auto exec --skip-git-repo-check -o "$assessment_file" "$prompt_text"
+  local -a args=(exec --skip-git-repo-check -m "$CODEX_REVIEW_MODEL"
+    -c "model_reasoning_effort=\"$CODEX_REVIEW_EFFORT\"" -s read-only -o "$assessment_file")
+  # With --json, stdout is a JSONL event stream (progress for debugging);
+  # the final message still lands in the -o file.
+  local events="$assessment_log" merge=1
+  if "${codex_cmd[@]}" exec --help 2>/dev/null | grep -q -- '--json'; then
+    args+=(--json); events="$codex_events_file"; merge=0
+  fi
+  if codex_is_legacy; then
+    run_with_timeout "$timeout_seconds" "$repo_abs" "" "$events" "$assessment_log" "$merge" \
+      "${codex_cmd[@]}" "${args[@]}" "$(/bin/cat "$prompt_file")"
     return
   fi
-  # Newer builds: read-only sandbox is enough for a review, and the prompt goes
-  # in over stdin so large diffs never hit the argument length limit.
-  run_with_timeout "$timeout_seconds" "$repo_abs" "$prompt_file" "$assessment_log" "$assessment_log" "1" \
-    codex exec --skip-git-repo-check -s read-only -C "$repo_abs" -o "$assessment_file" -
+  # Prompt over stdin so large diffs never hit the argument length limit.
+  run_with_timeout "$timeout_seconds" "$repo_abs" "$prompt_file" "$events" "$assessment_log" "$merge" \
+    "${codex_cmd[@]}" "${args[@]}" -C "$repo_abs" -
 }
 
 invoke_claude() {
-  local -a cmd=(claude -p --output-format text --effort low --permission-mode bypassPermissions --disable-slash-commands)
-  local -a add_dirs=("$repo_abs")
-  [[ -n "$diff_file" && "$diff_inline" -eq 0 ]] && add_dirs+=("$output_dir")
-
+  local -a cmd=(python3 "$script_dir/run-claude-review.py"
+    --repo "$repo_abs" --prompt "$prompt_file" --output-dir "$output_dir"
+    --timeout-seconds "$timeout_seconds" --resume-timeout-seconds "$resume_timeout_seconds")
   if [[ "$prompt_is_self_contained" -eq 1 ]]; then
-    cmd+=(--tools "")
-  else
-    local allowed='Read,Grep,GlobTool,Bash(git:*),Bash(sed:*),Bash(cat:*),Bash(rg:*),Bash(ls:*),Bash(find:*),Bash(wc:*)'
-    for d in "${add_dirs[@]}"; do cmd+=(--add-dir "$d"); done
-    cmd+=(--allowedTools "$allowed")
+    cmd+=(--self-contained)
   fi
-
-  run_with_timeout "$timeout_seconds" "$repo_abs" "$prompt_file" "$assessment_file" "$assessment_log" "0" \
-    "${cmd[@]}"
+  "${cmd[@]}"
 }
 
 # ============================================================
@@ -325,10 +455,14 @@ write_summary() {
     "context_source=$([[ "$context_stdin" -eq 1 ]] && printf 'stdin' || ([[ -n "$context_file" ]] && printf 'file' || printf 'none'))"
     "question=${question:-}"
     "timeout_seconds=$timeout_seconds"
+    "resume_timeout_seconds=$resume_timeout_seconds"
     "diff_bytes=$diff_bytes"
     "diff_inline=$diff_inline"
   )
   [[ -n "$range_spec" ]] && pairs+=("range=$range_spec")
+  [[ -n "$pr_number" ]] && pairs+=("pr=$pr_number")
+  pairs+=("diff_context=$diff_context" "include_generated=$include_generated")
+  [[ "$target_reviewer" == "codex" ]] && pairs+=("codex_model=$CODEX_REVIEW_MODEL" "codex_effort=$CODEX_REVIEW_EFFORT" "codex_events=$codex_events_file")
   pairs+=(
     "prompt=$prompt_file"
     "assessment=$assessment_file"
@@ -343,8 +477,10 @@ write_summary() {
 # ============================================================
 
 repo="" output_dir="" mode="" range_spec="" reviewer="auto"
-context_file="" context_stdin=0 question="" timeout_seconds=300
-dry_run=0 inline_diff_max_bytes=20000 inline_path_max_bytes=40000
+context_file="" context_stdin=0 question="" timeout_seconds=900 resume_timeout_seconds=300
+dry_run=0 inline_diff_max_bytes=40000 inline_path_max_bytes=40000
+pr_number="" diff_context=10 include_generated=0 untracked_max_bytes=100000
+rules_max_bytes=30000 history_max_files=20
 declare -a review_paths=()
 
 while (($# > 0)); do
@@ -356,9 +492,14 @@ while (($# > 0)); do
     --context-stdin)   context_stdin=1;          shift ;;
     --question)        question="${2:-}";        shift 2 ;;
     --timeout-seconds) timeout_seconds="${2:-}"; shift 2 ;;
+    --resume-timeout-seconds) resume_timeout_seconds="${2:-}"; shift 2 ;;
     --staged)          mode="staged";            shift ;;
     --working)         mode="working";           shift ;;
     --range)           mode="range"; range_spec="${2:-}"; shift 2 ;;
+    --base)            mode="range"; range_spec="${2:-}...HEAD"; [[ -n "${2:-}" ]] || range_spec=""; shift 2 ;;
+    --pr)              mode="pr"; pr_number="${2:-}"; shift 2 ;;
+    --diff-context)    diff_context="${2:-}"; shift 2 ;;
+    --include-generated) include_generated=1; shift ;;
     --path)
       [[ -n "$mode" && "$mode" != "paths" ]] && { echo "Cannot mix --path with $mode mode." >&2; exit 1; }
       mode="paths"; review_paths+=("${2:-}"); shift 2 ;;
@@ -374,11 +515,14 @@ done
 
 case "$reviewer" in auto|codex|claude) ;; *) echo "Unsupported reviewer target: $reviewer" >&2; exit 1 ;; esac
 [[ -z "$repo" || -z "$mode" ]]                    && { usage >&2; exit 1; }
-[[ "$mode" == "range" && -z "$range_spec" ]]       && { echo "--range requires a revision range." >&2; exit 1; }
+[[ "$mode" == "range" && -z "$range_spec" ]]       && { echo "--range/--base requires a revision." >&2; exit 1; }
+[[ "$mode" == "pr" ]] && validate_positive_integer "$pr_number" "--pr"
+[[ "$diff_context" =~ ^[0-9]+$ ]] || { echo "--diff-context must be a non-negative integer." >&2; exit 1; }
 [[ "$mode" == "paths" && "${#review_paths[@]}" -eq 0 ]] && { echo "--path mode requires at least one path." >&2; exit 1; }
 [[ -n "$context_file" && "$context_stdin" -eq 1 ]] && { echo "Use either --context-file or --context-stdin, not both." >&2; exit 1; }
 [[ -n "$context_file" && ! -f "$context_file" ]]   && { echo "Context file does not exist: $context_file" >&2; exit 1; }
 validate_positive_integer "$timeout_seconds" "--timeout-seconds"
+validate_positive_integer "$resume_timeout_seconds" "--resume-timeout-seconds"
 
 # ============================================================
 # Resolve paths and settings
@@ -392,11 +536,15 @@ target_reviewer="$(resolve_target_reviewer "$reviewer")"
 
 [[ ! -f "$evaluation_guide_file" ]] && { echo "Required change-evaluation guide is missing." >&2; exit 1; }
 command -v "$target_reviewer" >/dev/null 2>&1 || { echo "Missing required CLI: $target_reviewer" >&2; exit 1; }
+if [[ "$target_reviewer" == "claude" ]]; then
+  command -v python3 >/dev/null 2>&1 || { echo "Claude review requires python3." >&2; exit 1; }
+fi
 
 if [[ -z "$output_dir" ]]; then
   output_dir="$(resolve_output_root "$target_reviewer")/$(date '+%Y%m%d-%H%M%S')"
 fi
 /bin/mkdir -p "$output_dir"
+output_dir="$(cd "$output_dir" && pwd)"
 
 # ============================================================
 # Artifact paths
@@ -412,6 +560,12 @@ assessment_file="$output_dir/assessment.md"
 assessment_log="$output_dir/assessor-run.log"
 reviewer_file="$output_dir/reviewer.txt"
 summary_file="$output_dir/run-summary.txt"
+changed_files_file="$output_dir/changed-files.txt"
+rules_file="$output_dir/project-rules.md"
+history_file="$output_dir/history.md"
+skipped_file="$output_dir/skipped-files.txt"
+codex_events_file="$output_dir/codex-events.jsonl"
+: >"$skipped_file"
 
 # ============================================================
 # Resolve context input
@@ -430,12 +584,27 @@ fi
 # Generate diff / paths
 # ============================================================
 
+build_pathspec
 "generate_diff_${mode}"
 
 if [[ -n "$diff_file" ]]; then
   diff_bytes="$(wc -c <"$diff_file" | tr -d '[:space:]')"
   [[ "$diff_bytes" -le "$inline_diff_max_bytes" ]] && diff_inline=1
 fi
+
+# Eligibility gate: nothing to review means no reviewer call and no budget spent.
+if [[ -n "$diff_file" && "$diff_bytes" -eq 0 ]]; then
+  write_summary
+  printf 'assessment_status=no_changes\nassessment_reason=%s\n' \
+    "The $mode diff is empty after filtering; nothing to review." >>"$summary_file"
+  echo "No changes to review in $mode mode." >&2
+  [[ "$include_generated" -eq 0 ]] && echo "Lockfiles/generated files were filtered; pass --include-generated to keep them." >&2
+  exit 3
+fi
+
+collect_changed_files
+collect_project_rules
+collect_history
 [[ "$diff_inline" -eq 1 || "$path_contents_inline" -eq 1 ]] && prompt_is_self_contained=1
 
 # ============================================================
@@ -480,6 +649,9 @@ assessment_reason=""
 if [[ "$assessment_exit" -eq 124 ]]; then
   assessment_status="timeout"
   assessment_reason="Reviewer exceeded ${timeout_seconds}s before producing a complete result."
+  if [[ "$target_reviewer" == "claude" ]]; then
+    assessment_reason="Claude exceeded the ${timeout_seconds}s review limit and the ${resume_timeout_seconds}s same-session wrap-up limit. See both event logs and run-summary.txt."
+  fi
 elif [[ "$assessment_exit" -ne 0 ]]; then
   assessment_status="command_failed"
   assessment_reason="Reviewer command exited with code ${assessment_exit}."
@@ -497,4 +669,7 @@ printf 'assessment_exit=%s\nassessment_status=%s\nassessment_reason=%s\n' \
 printf 'target_reviewer=%s\nprompt_file=%s\nsummary_file=%s\nassessment_file=%s\nreviewer_file=%s\nassessment_log=%s\n' \
   "$target_reviewer" "$prompt_file" "$summary_file" "$assessment_file" "$reviewer_file" "$assessment_log"
 
-[[ "$assessment_exit" -ne 0 ]] && exit 1
+if [[ "$assessment_exit" -ne 0 ]]; then
+  exit 1
+fi
+exit 0

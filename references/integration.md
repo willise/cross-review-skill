@@ -9,44 +9,47 @@ Produce one final evaluation of the proposal or change, not a pasted external op
 ## Integration Order
 
 1. Inspect the code, diff, and host context yourself.
-2. Read the external assessment.
-3. Keep the points that survive direct inspection.
-4. Highlight where the external reviewer materially improved or corrected the host proposal.
-5. Discard weak, duplicate, or unsupported claims.
-6. Produce the final answer in a clear assessment format.
+2. Read the external assessment. Its findings follow the format in `change-evaluation.md`.
+3. Verify each external finding independently against the code at its `location`:
+   - `CONFIRMED`: you reproduced the reasoning and the failure scenario holds
+   - `PLAUSIBLE`: consistent with the code, but you could not fully confirm it
+   - `REJECTED`: wrong, unsupported, pre-existing, or on the false-positive list
+4. Re-score each surviving finding with the rubric in `change-evaluation.md`. Do not inherit the reviewer's score.
+5. Add findings of your own that the reviewer missed, scored the same way.
+6. Highlight where the external reviewer materially improved or corrected the host proposal.
+7. Produce the final answer in the format below.
 
 ## What to Keep
 
-Keep points that:
-
-- directly answer whether the change is reasonable
-- identify real risks or regressions
-- surface a simpler or stronger alternative
-- clarify what still needs validation
+- `CONFIRMED` findings scored 80 or higher go in the main findings list.
+- `PLAUSIBLE` findings, or confirmed ones scored 50-79, go in a separate "Worth checking" list, labelled as such.
+- Alternatives and validation steps that survive inspection.
 
 ## What to Discard
 
-Discard points that are:
+- `REJECTED` findings; mention them only if the user would otherwise be misled (one line each, with the reason).
+- Anything below 50 after your re-scoring.
+- Duplicates of a stronger finding.
+- Generic style commentary.
 
-- generic style commentary
-- unsupported by the code or context
-- duplicated by stronger findings
-- speculative without evidence
+## Failed or Incomplete Reviews
+
+- If the external run failed, timed out, or reported incomplete coverage, say so and rely on your own inspection.
+- Never present a missing or partial external result as a clean review.
 
 ## Final Output Shape
 
-Prefer this structure:
-
 1. overall judgment
-2. main risks
-3. better alternatives
-4. validation checklist
-5. open questions
+2. findings (`CONFIRMED`, scored 80 or higher): severity, `path:line`, claim, failure scenario
+3. worth checking (`PLAUSIBLE`, or scored 50-79)
+4. better alternatives
+5. validation checklist
+6. open questions
 
 If useful, add one short note such as:
 
-`Cross-check: validated with an external Claude CLI assessment.`
+`Cross-check: validated with an external Claude CLI assessment (N findings, M confirmed).`
 
 or
 
-`Cross-check: validated with an external Codex CLI assessment.`
+`Cross-check: validated with an external Codex CLI assessment (N findings, M confirmed).`

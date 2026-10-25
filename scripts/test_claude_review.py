@@ -257,6 +257,22 @@ class HelperTests(unittest.TestCase):
         self.assertIn(" line5\n", prompt)  # 10 context lines before the change
         self.assertIn("Confidence Rubric", prompt)
         self.assertIn("Not Findings", prompt)
+        self.assertIn("at most 8", prompt)
+        self.assertIn("under about 1,200 words", prompt)
+
+    def test_symlinked_or_copied_rules_are_inlined_once(self):
+        (self.repo / "AGENTS.md").symlink_to("CLAUDE.md")
+        (self.repo / "src" / "CLAUDE.md").write_text("Src rule: keep functions pure.\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "add rule aliases")
+        (self.repo / "src" / "app.py").write_text("x = 5\n")
+        result = self.run_helper("--working", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompt = (self.out / "prompt.md").read_text()
+        self.assertEqual(prompt.count("Root rule: never log secrets."), 1)
+        self.assertEqual(prompt.count("Src rule: keep functions pure."), 1)
+        self.assertIn("### AGENTS.md\n\n(same content as CLAUDE.md)", prompt)
+        self.assertIn("(same content as src/CLAUDE.md)", prompt)
 
     def test_large_untracked_file_is_listed_not_inlined(self):
         (self.repo / "src" / "app.py").write_text("x = 2\n")

@@ -72,8 +72,9 @@ These files are intentionally compact. They are guardrails, not the main payload
    - `run-summary.txt`
    - For Claude, `claude-events.jsonl` records live progress, `claude-session-id.txt` identifies the exact session, and `claude-resume-events.jsonl` records the wrap-up if needed. An empty final report does not mean the reviewer is idle; inspect the event logs.
    - These files are written to a host-private system directory by default, not into the repository.
+   - The reviewer is asked for at most 8 findings and a report under about 1,200 words; long reports were the main source of review latency.
    - For Codex, `codex-events.jsonl` records the JSON event stream when the installed CLI supports `--json`.
-   - The prompt also inlines the root and per-directory `CLAUDE.md` / `AGENTS.md` for changed files (`project-rules.md`) and the last commits touching each changed file (`history.md`), so a tool-less reviewer still sees project rules and intent.
+   - The prompt also inlines the root and per-directory `CLAUDE.md` / `AGENTS.md` for changed files, deduplicated by content so a symlinked `AGENTS.md` appears once (`project-rules.md`) and the last commits touching each changed file (`history.md`), so a tool-less reviewer still sees project rules and intent.
    - The helper prefers reviewing from the host context note and diff snapshot first. It should only inspect extra repository files when the diff alone is insufficient.
 5. Verify each external finding against the code and reconcile it with your own inspection using `references/integration.md`: label it CONFIRMED / PLAUSIBLE / REJECTED, re-score confidence, and keep only what survives.
 6. Produce one final answer focused on reasonableness, risks, alternatives, and validation, with each finding cited as `path:line`.

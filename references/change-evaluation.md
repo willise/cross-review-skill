@@ -51,7 +51,7 @@ Report only findings scored 50 or higher. Do not inflate scores to make a findin
 Use exactly these sections:
 
 1. **Overall judgment**: one of `reasonable`, `reasonable with changes`, `not reasonable`, or `insufficient evidence`, plus two or three sentences of reasoning.
-2. **Findings**: a numbered list, most severe first; write `None.` if there are none. Each finding:
+2. **Findings**: a numbered list of at most 8, most severe first; write `None.` if there are none. If more qualify, keep the 8 most important and list the rest under **Also noted** as one line each (`path:line` and the claim). Each finding:
    - `severity`: critical | high | medium | low
    - `confidence`: 0-100 per the rubric
    - `location`: `path:line` or `path:start-end`
@@ -63,5 +63,12 @@ Use exactly these sections:
 4. **Validation checklist**: what to verify before merge or rollout.
 5. **Open questions**: assumptions you could not confirm.
 6. **Coverage**: what you inspected and what you did not.
+
+## Length
+
+- Keep the whole report under about 1,200 words.
+- Each finding field is one or two lines. Quote only the few lines of code or rule text that prove the point; never repeat the diff.
+- Sections 3-6 are short bullet lists, not prose.
+- Write the report once. Do not draft it and then restate it.
 
 Keep the answer concrete and evidence-based.

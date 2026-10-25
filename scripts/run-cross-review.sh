@@ -207,9 +207,10 @@ collect_changed_files() {
 
 # CLAUDE.md / AGENTS.md at the repo root and in every directory above a changed
 # file. Inlined because a self-contained reviewer has no tools to find them.
+# Deduplicated by content: AGENTS.md is often a symlink to (or copy of) CLAUDE.md.
 collect_project_rules() {
   : >"$rules_file"
-  local seen="" total=0 f dir name cand sz
+  local seen="" seen_sums="" total=0 f dir name cand sz sum dup
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     if [[ -d "$repo_abs/$f" ]]; then dir="${f%/}"; else dir="$(dirname "$f")"; fi
@@ -219,6 +220,13 @@ collect_project_rules() {
         [[ -f "$repo_abs/$cand" ]] || continue
         grep -Fxq -- "$cand" <<<"$seen" && continue
         seen+="$cand"$'\n'
+        sum="$(cksum <"$repo_abs/$cand" | tr -s ' ' ' ')"
+        dup="$(awk -F'\t' -v s="$sum" '$1 == s { print $2; exit }' <<<"$seen_sums")"
+        if [[ -n "$dup" ]]; then
+          printf '### %s\n\n(same content as %s)\n\n' "$cand" "$dup" >>"$rules_file"
+          continue
+        fi
+        seen_sums+="$sum"$'\t'"$cand"$'\n'
         sz="$(wc -c <"$repo_abs/$cand" | tr -d '[:space:]')"
         if [[ $((total + sz)) -gt "$rules_max_bytes" ]]; then
           printf '### %s\n\n(omitted: rules size budget exceeded)\n\n' "$cand" >>"$rules_file"
@@ -369,7 +377,7 @@ QUESTIONS
 - Avoid generic code-style commentary unless it materially affects the proposal.
 - Ground claims in the code, diff, or provided context.
 - Only report problems introduced or exposed by this change, not pre-existing ones on untouched lines.
-- Follow the change-evaluation guide below, including its false-positive list, confidence rubric, and exact output format.
+- Follow the change-evaluation guide below, including its false-positive list, confidence rubric, exact output format, and length limits.
 
 BEHAVIOR
 
